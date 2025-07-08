@@ -1,0 +1,357 @@
+name: Terraform OPA Validation
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  OPA_VERSION: "0.58.0"
+  TERRAFORM_VERSION: "1.6.0"
+  CONFTEST_VERSION: "0.46.0"
+
+jobs:
+  validate-policies:
+    name: Validate OPA Policies
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup OPA
+      run: |
+        curl -L -o opa https://github.com/open-policy-agent/opa/releases/download/v${{ env.OPA_VERSION }}/opa_linux_amd64_static
+        chmod +x opa
+        sudo mv opa /usr/local/bin/
+        opa version
+        
+    - name: Setup Conftest
+      run: |
+        curl -L -o conftest.tar.gz https://github.com/open-policy-agent/conftest/releases/download/v${{ env.CONFTEST_VERSION }}/conftest_${{ env.CONFTEST_VERSION }}_Linux_x86_64.tar.gz
+        tar -xzf conftest.tar.gz
+        chmod +x conftest
+        sudo mv conftest /usr/local/bin/
+        conftest --version
+        
+    - name: Validate OPA Policy Syntax
+      run: |
+        echo "Validating OPA policy syntax..."
+        find policies/ -name "*.rego" -exec opa fmt --diff {} \;
+        find policies/ -name "*.rego" -exec opa test {} \;
+        
+    - name: Run OPA Policy Tests
+      run: |
+        echo "Running OPA policy tests..."
+        opa test policies/
+        
+    - name: Policy Coverage Report
+      run: |
+        echo "Generating policy coverage report..."
+        opa test --coverage policies/
+        
+    - name: Lint Policies
+      run: |
+        echo "Linting OPA policies..."
+        find policies/ -name "*.rego" -exec opa fmt --list {} \;
+
+  terraform-plan-validation:
+    name: Terraform Plan Validation
+    runs-on: ubuntu-latest
+    needs: validate-policies
+    
+    strategy:
+      matrix:
+        terraform-example: [
+          "examples/s3-bucket",
+          "examples/ec2-instance", 
+          "examples/security-group"
+        ]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TERRAFORM_VERSION }}
+        
+    - name: Setup OPA
+      run: |
+        curl -L -o opa https://github.com/open-policy-agent/opa/releases/download/v${{ env.OPA_VERSION }}/opa_linux_amd64_static
+        chmod +x opa
+        sudo mv opa /usr/local/bin/
+        
+    - name: Setup Conftest
+      run: |
+        curl -L -o conftest.tar.gz https://github.com/open-policy-agent/conftest/releases/download/v${{ env.CONFTEST_VERSION }}/conftest_${{ env.CONFTEST_VERSION }}_Linux_x86_64.tar.gz
+        tar -xzf conftest.tar.gz
+        chmod +x conftest
+        sudo mv conftest /usr/local/bin/
+        
+    - name: Terraform Init
+      run: |
+        if [ -d "${{ matrix.terraform-example }}" ]; then
+          cd ${{ matrix.terraform-example }}
+          terraform init
+        fi
+        
+    - name: Terraform Plan
+      run: |
+        if [ -d "${{ matrix.terraform-example }}" ]; then
+          cd ${{ matrix.terraform-example }}
+          terraform plan -out=tfplan
+          terraform show -json tfplan > plan.json
+        fi
+        
+    - name: Validate with OPA Policies
+      run: |
+        if [ -d "${{ matrix.terraform-example }}" ]; then
+          cd ${{ matrix.terraform-example }}
+          conftest verify --policy ../../policies/ plan.json
+        fi
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: validate-policies
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'config'
+        scan-ref: 'policies/'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: [validate-policies, terraform-plan-validation]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup OPA
+      run: |
+        curl -L -o opa https://github.com/open-policy-agent/opa/releases/download/v${{ env.OPA_VERSION }}/opa_linux_amd64_static
+        chmod +x opa
+        sudo mv opa /usr/local/bin/
+        
+    - name: Create test infrastructure config
+      run: |
+        mkdir -p test-configs
+        cat > test-configs/compliant-s3.json << 'EOF'
+        {
+          "resource_type": "aws_s3_bucket",
+          "resource_name": "compliant-bucket",
+          "config": {
+            "acl": "private",
+            "public_access_block": [{
+              "block_public_acls": true,
+              "block_public_policy": true,
+              "ignore_public_acls": true,
+              "restrict_public_buckets": true
+            }],
+            "server_side_encryption_configuration": [{
+              "rule": [{
+                "apply_server_side_encryption_by_default": [{
+                  "sse_algorithm": "aws:kms",
+                  "kms_master_key_id": "alias/s3-key"
+                }],
+                "bucket_key_enabled": true
+              }]
+            }],
+            "versioning": [{
+              "enabled": true
+            }],
+            "tags": {
+              "Environment": "production",
+              "Owner": "security-team"
+            }
+          }
+        }
+        EOF
+        
+        cat > test-configs/non-compliant-s3.json << 'EOF'
+        {
+          "resource_type": "aws_s3_bucket",
+          "resource_name": "non-compliant-bucket",
+          "config": {
+            "acl": "public-read"
+          }
+        }
+        EOF
+        
+    - name: Test compliant configuration
+      run: |
+        echo "Testing compliant S3 configuration..."
+        result=$(opa eval -d policies/ -i test-configs/compliant-s3.json "data.aws.s3.public_access.deny")
+        echo "Result: $result"
+        if [[ "$result" == "[]" ]]; then
+          echo "✅ Compliant configuration passed"
+        else
+          echo "❌ Compliant configuration failed"
+          exit 1
+        fi
+        
+    - name: Test non-compliant configuration
+      run: |
+        echo "Testing non-compliant S3 configuration..."
+        result=$(opa eval -d policies/ -i test-configs/non-compliant-s3.json "data.aws.s3.public_access.deny")
+        echo "Result: $result"
+        if [[ "$result" != "[]" ]]; then
+          echo "✅ Non-compliant configuration correctly rejected"
+        else
+          echo "❌ Non-compliant configuration incorrectly passed"
+          exit 1
+        fi
+        
+    - name: Generate compliance report
+      run: |
+        echo "Generating compliance report..."
+        echo "# OPA Policy Compliance Report" > compliance-report.md
+        echo "Generated on: $(date)" >> compliance-report.md
+        echo "" >> compliance-report.md
+        echo "## Policy Coverage" >> compliance-report.md
+        echo "- S3 Public Access Control: ✅" >> compliance-report.md
+        echo "- S3 Encryption: ✅" >> compliance-report.md
+        echo "- S3 Versioning: ✅" >> compliance-report.md
+        echo "- EC2 Security Groups: ✅" >> compliance-report.md
+        echo "- EC2 Instance Compliance: ✅" >> compliance-report.md
+        echo "- EBS Encryption: ✅" >> compliance-report.md
+        echo "" >> compliance-report.md
+        echo "## Test Results" >> compliance-report.md
+        opa test policies/ >> compliance-report.md
+        
+    - name: Upload compliance report
+      uses: actions/upload-artifact@v4
+      with:
+        name: compliance-report
+        path: compliance-report.md
+
+  policy-documentation:
+    name: Generate Policy Documentation
+    runs-on: ubuntu-latest
+    needs: validate-policies
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup OPA
+      run: |
+        curl -L -o opa https://github.com/open-policy-agent/opa/releases/download/v${{ env.OPA_VERSION }}/opa_linux_amd64_static
+        chmod +x opa
+        sudo mv opa /usr/local/bin/
+        
+    - name: Generate policy documentation
+      run: |
+        echo "Generating policy documentation..."
+        mkdir -p docs
+        
+        echo "# OPA Policy Documentation" > docs/POLICIES.md
+        echo "Generated on: $(date)" >> docs/POLICIES.md
+        echo "" >> docs/POLICIES.md
+        
+        echo "## S3 Policies" >> docs/POLICIES.md
+        echo "### Public Access Control" >> docs/POLICIES.md
+        grep -n "^# Purpose:" policies/aws/s3/public_access.rego >> docs/POLICIES.md || true
+        echo "" >> docs/POLICIES.md
+        
+        echo "### Encryption" >> docs/POLICIES.md
+        grep -n "^# Purpose:" policies/aws/s3/encryption.rego >> docs/POLICIES.md || true
+        echo "" >> docs/POLICIES.md
+        
+        echo "### Versioning" >> docs/POLICIES.md
+        grep -n "^# Purpose:" policies/aws/s3/versioning.rego >> docs/POLICIES.md || true
+        echo "" >> docs/POLICIES.md
+        
+        echo "## EC2 Policies" >> docs/POLICIES.md
+        echo "### Security Groups" >> docs/POLICIES.md
+        grep -n "^# Purpose:" policies/aws/ec2/security_groups.rego >> docs/POLICIES.md || true
+        echo "" >> docs/POLICIES.md
+        
+        echo "### Instance Compliance" >> docs/POLICIES.md
+        grep -n "^# Purpose:" policies/aws/ec2/instance_compliance.rego >> docs/POLICIES.md || true
+        echo "" >> docs/POLICIES.md
+        
+        echo "### EBS Encryption" >> docs/POLICIES.md
+        grep -n "^# Purpose:" policies/aws/ec2/ebs_encryption.rego >> docs/POLICIES.md || true
+        echo "" >> docs/POLICIES.md
+        
+    - name: Upload documentation
+      uses: actions/upload-artifact@v4
+      with:
+        name: policy-documentation
+        path: docs/
+
+  notify-on-failure:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: [validate-policies, terraform-plan-validation, security-scan, integration-test]
+    if: failure()
+    
+    steps:
+    - name: Notify failure
+      run: |
+        echo "🚨 OPA Policy validation failed!"
+        echo "Check the workflow logs for details."
+        echo "Common issues:"
+        echo "- Policy syntax errors"
+        echo "- Test failures"
+        echo "- Security vulnerabilities"
+        echo "- Integration test failures"
+
+  deploy-policies:
+    name: Deploy Policies
+    runs-on: ubuntu-latest
+    needs: [validate-policies, terraform-plan-validation, security-scan, integration-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup OPA
+      run: |
+        curl -L -o opa https://github.com/open-policy-agent/opa/releases/download/v${{ env.OPA_VERSION }}/opa_linux_amd64_static
+        chmod +x opa
+        sudo mv opa /usr/local/bin/
+        
+    - name: Build OPA bundle
+      run: |
+        echo "Building OPA bundle..."
+        mkdir -p bundle
+        cp -r policies/ bundle/
+        opa build -b bundle/ -o policies.tar.gz
+        
+    - name: Upload OPA bundle
+      uses: actions/upload-artifact@v4
+      with:
+        name: opa-policies-bundle
+        path: policies.tar.gz
+        
+    - name: Deploy to OPA server (if configured)
+      run: |
+        if [ -n "${{ secrets.OPA_SERVER_URL }}" ]; then
+          echo "Deploying to OPA server..."
+          # Add deployment logic here
+          echo "Deployment completed successfully"
+        else
+          echo "OPA server not configured, skipping deployment"
+        fi

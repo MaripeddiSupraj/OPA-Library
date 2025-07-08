@@ -1,0 +1,384 @@
+# .github/workflows/terraform-opa-validation.yml
+name: Terraform Plan and OPA Validation
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/**'
+      - 'infrastructure/**'
+      - 'policies/**'
+    types: [opened, synchronize, reopened]
+
+env:
+  TF_VERSION: "1.5.0"
+  OPA_VERSION: "0.57.0"
+  CONFTEST_VERSION: "0.46.0"
+
+jobs:
+  terraform-plan:
+    name: 🏗️ Terraform Plan
+    runs-on: ubuntu-latest
+    outputs:
+      plan-output: ${{ steps.plan.outputs.stdout }}
+      plan-exitcode: ${{ steps.plan.outputs.exitcode }}
+      plan-file: ${{ steps.plan.outputs.plan-file }}
+    
+    steps:
+    - name: 📋 Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: ⚙️ Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        terraform_wrapper: false
+    
+    - name: 🔧 Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    
+    - name: 🔍 Terraform Format Check
+      id: fmt
+      run: terraform fmt -check -recursive
+      continue-on-error: true
+    
+    - name: 🚀 Terraform Init
+      id: init
+      run: |
+        cd terraform
+        terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
+    
+    - name: ✅ Terraform Validate
+      id: validate
+      run: |
+        cd terraform
+        terraform validate -no-color
+    
+    - name: 📊 Terraform Plan
+      id: plan
+      run: |
+        cd terraform
+        terraform plan -no-color -out=tfplan -detailed-exitcode
+        
+        # Convert plan to JSON for OPA analysis
+        terraform show -json tfplan > tfplan.json
+        
+        # Store plan output for PR comment
+        terraform show -no-color tfplan > tfplan.txt
+        
+        # Upload plan files as artifacts
+        echo "plan-file=tfplan.json" >> $GITHUB_OUTPUT
+      continue-on-error: true
+    
+    - name: 📤 Upload Plan Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-plan
+        path: |
+          terraform/tfplan.json
+          terraform/tfplan.txt
+          terraform/tfplan
+        retention-days: 5
+    
+    - name: 💬 Post Plan Comment
+      uses: actions/github-script@v7
+      if: github.event_name == 'pull_request'
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          // Read the plan output
+          const planOutput = fs.readFileSync('terraform/tfplan.txt', 'utf8');
+          
+          // Truncate if too long for GitHub comment
+          const maxLength = 65000;
+          const truncatedPlan = planOutput.length > maxLength 
+            ? planOutput.substring(0, maxLength) + '\n\n... (truncated)'
+            : planOutput;
+          
+          const comment = `## 🏗️ Terraform Plan Results
+          
+          <details>
+          <summary>📋 Plan Details (Click to expand)</summary>
+          
+          \`\`\`hcl
+          ${truncatedPlan}
+          \`\`\`
+          
+          </details>
+          
+          **Plan Status:** ${{ steps.plan.outcome }}
+          **Format Check:** ${{ steps.fmt.outcome }}
+          **Validation:** ${{ steps.validate.outcome }}
+          
+          📊 **Plan Summary:**
+          - Plan file: \`terraform/tfplan.json\`
+          - Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          
+          > Next: OPA Policy validation will run automatically
+          `;
+          
+          // Find existing comment and update or create new one
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          
+          const existingComment = comments.find(comment => 
+            comment.body.includes('🏗️ Terraform Plan Results')
+          );
+          
+          if (existingComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existingComment.id,
+              body: comment
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+          }
+    
+    - name: ❌ Fail if Plan Failed
+      if: steps.plan.outcome == 'failure'
+      run: |
+        echo "❌ Terraform plan failed"
+        exit 1
+
+  opa-policy-check:
+    name: 🛡️ OPA Policy Validation
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: needs.terraform-plan.outputs.plan-exitcode != '1'
+    
+    steps:
+    - name: 📋 Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: 📥 Download Plan Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: terraform-plan
+        path: terraform/
+    
+    - name: ⚙️ Setup OPA
+      uses: open-policy-agent/setup-opa@v2
+      with:
+        version: ${{ env.OPA_VERSION }}
+    
+    - name: 📦 Install Conftest
+      run: |
+        wget -q https://github.com/open-policy-agent/conftest/releases/download/v${{ env.CONFTEST_VERSION }}/conftest_${{ env.CONFTEST_VERSION }}_Linux_x86_64.tar.gz
+        tar xzf conftest_${{ env.CONFTEST_VERSION }}_Linux_x86_64.tar.gz
+        sudo mv conftest /usr/local/bin
+        conftest --version
+    
+    - name: 🔍 Validate OPA Policies
+      run: |
+        echo "🔍 Validating OPA policies..."
+        opa fmt --list policies/
+        opa test policies/
+    
+    - name: 🛡️ Run OPA Policy Check
+      id: opa-check
+      run: |
+        echo "🛡️ Running OPA policy validation against Terraform plan..."
+        
+        # Create results directory
+        mkdir -p results
+        
+        # Run conftest with detailed output
+        conftest verify --policy policies/ terraform/tfplan.json \
+          --output json > results/opa-results.json || true
+        
+        # Run conftest with human-readable output
+        conftest verify --policy policies/ terraform/tfplan.json \
+          --output table > results/opa-results.txt || true
+        
+        # Check exit code
+        CONFTEST_EXIT_CODE=$?
+        echo "opa-exit-code=$CONFTEST_EXIT_CODE" >> $GITHUB_OUTPUT
+        
+        # Display results
+        echo "📊 OPA Policy Results:"
+        cat results/opa-results.txt
+        
+        # Count violations
+        VIOLATIONS=$(jq '.[] | select(.failures != null) | .failures | length' results/opa-results.json 2>/dev/null | jq -s 'add' || echo "0")
+        echo "violations-count=$VIOLATIONS" >> $GITHUB_OUTPUT
+        
+        if [ "$VIOLATIONS" -gt 0 ]; then
+          echo "❌ Found $VIOLATIONS policy violations"
+          exit 1
+        else
+          echo "✅ All OPA policies passed"
+        fi
+    
+    - name: 📤 Upload OPA Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: opa-results
+        path: results/
+        retention-days: 30
+    
+    - name: 💬 Post OPA Results Comment
+      uses: actions/github-script@v7
+      if: always() && github.event_name == 'pull_request'
+      with:
+        script: |
+          const fs = require('fs');
+          
+          // Read OPA results
+          let opaResults = '';
+          try {
+            opaResults = fs.readFileSync('results/opa-results.txt', 'utf8');
+          } catch (error) {
+            opaResults = 'Error reading OPA results';
+          }
+          
+          const violations = '${{ steps.opa-check.outputs.violations-count }}';
+          const exitCode = '${{ steps.opa-check.outputs.opa-exit-code }}';
+          
+          const status = violations === '0' ? '✅ PASSED' : '❌ FAILED';
+          const emoji = violations === '0' ? '🎉' : '🚨';
+          
+          const comment = `## 🛡️ OPA Policy Validation Results ${emoji}
+          
+          **Status:** ${status}
+          **Violations Found:** ${violations}
+          **Exit Code:** ${exitCode}
+          
+          <details>
+          <summary>📋 Detailed Results (Click to expand)</summary>
+          
+          \`\`\`
+          ${opaResults}
+          \`\`\`
+          
+          </details>
+          
+          ### 📊 Policy Summary:
+          - **S3 Policies:** Public access, encryption, versioning
+          - **EC2 Policies:** Security groups, instance compliance, EBS encryption
+          - **Report:** Available in workflow artifacts
+          
+          **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          
+          ${violations === '0' ? '🎉 All policies passed! PR ready for review.' : '🚨 Policy violations found. Please fix before merging.'}
+          `;
+          
+          // Find existing OPA comment and update or create new one
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          
+          const existingComment = comments.find(comment => 
+            comment.body.includes('🛡️ OPA Policy Validation Results')
+          );
+          
+          if (existingComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existingComment.id,
+              body: comment
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+          }
+
+  # Optional: Security scan with additional tools
+  security-scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    needs: [terraform-plan, opa-policy-check]
+    if: needs.opa-policy-check.result == 'success'
+    
+    steps:
+    - name: 📋 Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: 📥 Download Plan Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: terraform-plan
+        path: terraform/
+    
+    - name: 🔍 Run TFSec
+      uses: aquasecurity/tfsec-action@v1.0.3
+      with:
+        working_directory: terraform
+        format: json
+        soft_fail: true
+    
+    - name: 🔍 Run Checkov
+      uses: bridgecrewio/checkov-action@v12
+      with:
+        directory: terraform
+        framework: terraform
+        output_format: json
+        soft_fail: true
+    
+    - name: 💬 Post Security Summary
+      uses: actions/github-script@v7
+      if: always() && github.event_name == 'pull_request'
+      with:
+        script: |
+          const comment = `## 🔒 Security Scan Summary
+          
+          **TFSec:** ${{ steps.tfsec.outcome }}
+          **Checkov:** ${{ steps.checkov.outcome }}
+          
+          📊 **Security Report:**
+          - Additional security validations completed
+          - Detailed results available in workflow artifacts
+          
+          **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          `;
+          
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            body: comment
+          });
+
+  # Status check summary
+  status-check:
+    name: 📋 Status Check Summary
+    runs-on: ubuntu-latest
+    needs: [terraform-plan, opa-policy-check]
+    if: always()
+    
+    steps:
+    - name: 📊 Summary
+      run: |
+        echo "📋 Workflow Summary:"
+        echo "- Terraform Plan: ${{ needs.terraform-plan.result }}"
+        echo "- OPA Policy Check: ${{ needs.opa-policy-check.result }}"
+        
+        if [ "${{ needs.terraform-plan.result }}" == "success" ] && [ "${{ needs.opa-policy-check.result }}" == "success" ]; then
+          echo "✅ All checks passed!"
+          exit 0
+        else
+          echo "❌ Some checks failed"
+          exit 1
+        fi

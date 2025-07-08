@@ -318,7 +318,7 @@ deny[msg] if {
     
     # Check if required tags are missing
     existing_tags := object.keys(input.config.tags)
-    missing_tags := required_sg_tags - existing_tags
+    missing_tags := [tag | tag := required_sg_tags[_]; not tag in existing_tags]
     count(missing_tags) > 0
     
     msg := sprintf("Security group '%s' is missing required tags: %v. Add these tags for compliance and resource management.", [

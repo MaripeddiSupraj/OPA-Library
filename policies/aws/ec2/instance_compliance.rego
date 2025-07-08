@@ -40,7 +40,7 @@ deny[msg] if {
     
     # Check if required tags are missing
     existing_tags := object.keys(input.config.tags)
-    missing_tags := required_instance_tags - existing_tags
+    missing_tags := [tag | tag := required_instance_tags[_]; not tag in existing_tags]
     count(missing_tags) > 0
     
     msg := sprintf("EC2 instance '%s' is missing required tags: %v. Add these tags for compliance and cost tracking.", [
@@ -347,7 +347,7 @@ info[msg] if {
     
     # Count required tags that are present
     existing_tags := object.keys(input.config.tags)
-    present_tags := required_instance_tags & existing_tags
+    present_tags := [tag | tag := required_instance_tags[_]; tag in existing_tags]
     
     msg := sprintf("EC2 instance '%s' has %d/%d required tags: %v", [
         input.resource_name,
